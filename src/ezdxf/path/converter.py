@@ -62,6 +62,7 @@ from ezdxf.entities.polygon import DXFPolygon
 from .path import Path
 from .commands import Command
 from . import tools
+from .bulge import vertices_and_bulges
 from .nesting import group_paths
 
 __all__ = [
@@ -254,7 +255,7 @@ def _from_hatch(hatch: Hatch, **kwargs) -> Path:
             from_hatch_boundary_path(boundary, ocs, elevation, offset=offset)
             for boundary in hatch.paths
         ]
-    except const.DXFStructureError:  
+    except const.DXFStructureError:
         # TODO: fix problems beforehand in audit process? see issue #1081
         logger.warning(f"invalid data in {str(hatch)}")
         return Path()
@@ -517,6 +518,12 @@ def to_lwpolylines(
     is the WCS z-axis. The plane elevation is the distance from the WCS origin
     to the start point of the first path.
 
+    Cubic Bèzier segments which represent an exact circular arc are written as
+    polyline arc segments with a real bulge value (adjacent arcs on the same
+    circle are merged, full circles become two semicircles); free-form curves
+    are still flattened into line segments.  A closed contour is finished by
+    the closed flag instead of a repeated start vertex.
+
     Args:
         paths: iterable of :class:`Path` objects
         distance:  maximum distance, see :meth:`Path.flattening`
@@ -548,7 +555,12 @@ def to_lwpolylines(
     for path in tools.single_paths(paths):
         if len(path) > 0:
             p = LWPolyline.new(dxfattribs=dxfattribs)
-            p.append_points(path.flattening(distance, segments), format="xy")
+            vertices, bulges, closed = vertices_and_bulges(path, distance, segments)
+            p.append_points(
+                ((v.x, v.y, b) for v, b in zip(vertices, bulges)), format="xyb"
+            )
+            if closed:
+                p.closed = True
             yield p
 
 
@@ -572,6 +584,10 @@ def to_polylines2d(
     onto the plane normal to this extrusion vector. The default extrusion vector
     is the WCS z-axis. The plane elevation is the distance from the WCS origin
     to the start point of the first path.
+
+    Circular arcs are written as arc segments with real bulge values while
+    free-form curves are flattened; closed contours use the closed flag instead
+    of a repeated start vertex.
 
     Args:
         paths: iterable of :class:`Path` objects
@@ -604,7 +620,11 @@ def to_polylines2d(
     for path in tools.single_paths(paths):
         if len(path) > 0:
             p = Polyline.new(dxfattribs=dxfattribs)
-            p.append_vertices(path.flattening(distance, segments))
+            vertices, bulges, closed = vertices_and_bulges(path, distance, segments)
+            for vertex, bulge in zip(vertices, bulges):
+                p.append_vertex(vertex, dxfattribs={"bulge": bulge})
+            if closed:
+                p.close()
             p.new_seqend()
             yield p
 
@@ -622,6 +642,8 @@ def to_hatches(
     """Convert the given `paths` into :class:`~ezdxf.entities.Hatch` entities.
     Uses LWPOLYLINE paths for boundaries without curves and edge paths, build
     of LINE and SPLINE edges, as boundary paths for boundaries including curves.
+    Polyline boundary paths (``edge_path=False``) keep circular arcs as bulge
+    arc segments instead of flattening them.
     The `extrusion` vector is applied to all paths, all vertices are projected
     onto the plane normal to this extrusion vector. The default extrusion vector
     is the WCS z-axis. The plane elevation is the distance from the WCS origin
@@ -666,7 +688,8 @@ def to_mpolygons(
 ) -> Iterator[MPolygon]:
     """Convert the given `paths` into :class:`~ezdxf.entities.MPolygon` entities.
     In contrast to HATCH, MPOLYGON supports only polyline boundary paths.
-    All curves will be approximated.
+    Circular arcs are written as boundary arc segments with bulge values;
+    free-form curves are still approximated by line segments.
 
     The `extrusion` vector is applied to all paths, all vertices are projected
     onto the plane normal to this extrusion vector. The default extrusion vector
@@ -719,9 +742,7 @@ def build_edge_path(
                     edge_path.add_line(prev, p)
                     prev = p
     else:  # Polyline boundary path
-        boundaries.add_polyline_path(
-            Vec2.generate(path.flattening(distance, segments)), flags=flags
-        )
+        build_poly_path(boundaries, path, flags, distance, segments)
 
 
 def build_poly_path(
@@ -731,9 +752,12 @@ def build_poly_path(
     distance: float,
     segments: int,
 ):
+    vertices, bulges, closed = vertices_and_bulges(path, distance, segments)
     boundaries.add_polyline_path(
-        # Vec2 removes the z-axis, which would be interpreted as bulge value!
-        Vec2.generate(path.flattening(distance, segments)),
+        # (x, y, bulge) tuples; the closed state is stored in the PolylinePath
+        # flag instead of repeating the start vertex at the end.
+        ((v.x, v.y, b) for v, b in zip(vertices, bulges)),
+        is_closed=closed,
         flags=flags,
     )
 

@@ -1,4 +1,10 @@
 ## Version 1.4.6 - dev
+	- NEW: `to_lwpolylines()`, `to_polylines2d()` and the polyline boundary paths of
+		HATCH/MPOLYGON now write circular arcs as real bulge arc segments instead of
+		flattening them into line segments; adjacent arcs on the same circle are merged,
+		full circles become two semicircles, closed contours use the closed flag instead
+		of a repeated start vertex and free-form curves keep their distance/segments
+		error control
 	- BUGFIX: Fix JSON export of string values with a backslash or double quote
 		- {{pr 1433}}
 		- contributed by #spicysharkco

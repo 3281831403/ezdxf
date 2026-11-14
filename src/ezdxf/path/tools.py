@@ -400,7 +400,8 @@ def render_mpolygons(
 ) -> EntityQuery:
     """Render the given `paths` into `layout` as
     :class:`~ezdxf.entities.MPolygon` entities. The MPOLYGON entity supports
-    only polyline boundary paths. All curves will be approximated.
+    only polyline boundary paths. Circular arcs are kept as bulge arc
+    segments, free-form curves will be approximated.
 
     The `extrusion` vector is applied to all paths, all vertices are projected
     onto the plane normal to this extrusion vector. The default extrusion vector

@@ -410,7 +410,12 @@ class TestToEntityConverter:
         p0 = polylines[0]
         assert p0.dxftype() == "LWPOLYLINE"
         assert tuple(p0[0]) == (0, 0, 0, 0, 0)  # x, y, swidth, ewidth, bulge
-        assert tuple(p0[-1]) == (0, 0, 0, 0, 0)
+        # The closed contour uses the closed flag instead of a repeated start
+        # vertex, so the last vertex is the point before the closing segment.
+        assert p0.closed is True
+        assert tuple(p0[-1]) == (0.19873046875, 0.17578125, 0, 0, 0)
+        # no extra coincident closing vertex
+        assert len(p0) == len(list(path.flattening(0.01, 4))) - 1
 
     def test_to_lwpolylines_with_wcs_elevation(self, path1):
         polylines = list(to_lwpolylines(path1))
@@ -460,7 +465,10 @@ class TestToEntityConverter:
         assert p0.dxftype() == "POLYLINE"
         assert p0.is_2d_polyline is True
         assert p0[0].dxf.location == (0, 0, 0)
-        assert p0[-1].dxf.location == (0, 0, 0)
+        # The closed contour uses the closed flag instead of a repeated start
+        # vertex, so the last vertex is the point before the closing segment.
+        assert p0.is_closed is True
+        assert p0[-1].dxf.location == (0.19873046875, 0.17578125, 0.17578125)
 
     def test_to_polylines2d_with_wcs_elevation(self, path1):
         polylines = list(to_polylines2d(path1))
@@ -503,13 +511,15 @@ class TestToEntityConverter:
         assert h0.dxf.extrusion.isclose(extrusion)
         polypath0 = h0.paths[0]
         assert (
-            all(abs(a) < 1e-12 for a in polypath0.vertices[0])
-            is True  # ~(0, 0, 0)
+            all(abs(a) < 1e-12 for a in polypath0.vertices[0]) is True  # ~(0, 0, 0)
         )  # x, y, bulge
-        assert (
-            all(abs(a) < 1e-12 for a in polypath0.vertices[-1])
-            is True  # ~(0, 0, 0)
-        ), "should be closed automatically"
+        # The boundary is closed via the closed flag instead of repeating the
+        # start vertex; the last vertex keeps its real coordinates and bulge.
+        assert polypath0.is_closed is True
+        x, y, bulge = polypath0.vertices[-1]
+        assert x == pytest.approx(4.0, abs=1e-12)
+        assert abs(y) < 1e-12
+        assert abs(bulge) < 1e-12
 
     def test_to_edge_path_hatches(self, path):
         hatches = list(to_hatches(path, edge_path=True))
@@ -679,10 +689,7 @@ class TestAllLinesToCurveConverter:
         vertices = list(path.flattening(1))
         assert len(vertices) > 2
         assert all(
-            [
-                math.isclose(v.x, v.y) and math.isclose(v.x, v.z)
-                for v in vertices
-            ]
+            [math.isclose(v.x, v.y) and math.isclose(v.x, v.z) for v in vertices]
         ), "all vertices have to be located along a line (x == y == z)"
 
     def test_remove_line_segments_of_zero_length_at_the_start(self):
@@ -796,3 +803,267 @@ def test_polyline_with_bulge_value_greater_one():
     p = make_path(pline, segments=12)
 
     assert len(p) == 4
+
+
+class TestCircularArcToBulge:
+    """Circular arcs have to be written as real bulge segments instead of being
+    flattened into many short line segments.
+    """
+
+    @staticmethod
+    def _arc_path(center=(0.0, 0.0), radius=5.0, start=0.0, end=90.0):
+        from ezdxf.entities import Arc
+
+        arc = Arc()
+        arc.dxf.center = center
+        arc.dxf.radius = radius
+        arc.dxf.start_angle = start
+        arc.dxf.end_angle = end
+        return make_path(arc)
+
+    def test_quarter_arc_lwpolyline_has_single_bulge(self):
+        lwp = list(to_lwpolylines(self._arc_path()))[0]
+        points = lwp.get_points("xyb")
+        assert len(points) == 2
+        # fixed coordinates of the arc endpoints
+        assert points[0][0] == pytest.approx(5.0)
+        assert points[0][1] == pytest.approx(0.0)
+        assert points[1][0] == pytest.approx(0.0)
+        assert points[1][1] == pytest.approx(5.0)
+        # bulge of a 90 degree arc is tan(90/4) = tan(22.5)
+        assert points[0][2] == pytest.approx(math.tan(math.pi / 8.0))
+        assert points[1][2] == 0.0
+        assert lwp.closed is False
+
+    def test_quarter_arc_polyline2d_has_single_bulge(self):
+        pline = list(to_polylines2d(self._arc_path()))[0]
+        assert len(pline.vertices) == 2
+        assert pline.vertices[0].dxf.bulge == pytest.approx(math.tan(math.pi / 8.0))
+        assert pline.vertices[1].dxf.bulge == 0.0
+        assert pline.is_closed is False
+
+    def test_quarter_arc_hatch_poly_path_has_bulge(self):
+        hatch = list(to_hatches(self._arc_path(), edge_path=False))[0]
+        boundary = hatch.paths[0]
+        assert boundary.has_bulge() is True
+        assert len(boundary.vertices) == 2
+        x, y, bulge = boundary.vertices[0]
+        assert x == pytest.approx(5.0)
+        assert y == pytest.approx(0.0)
+        assert bulge == pytest.approx(math.tan(math.pi / 8.0))
+
+    def test_quarter_arc_mpolygon_path_has_bulge(self):
+        polygon = list(to_mpolygons(self._arc_path()))[0]
+        boundary = polygon.paths[0]
+        assert boundary.has_bulge() is True
+        assert len(boundary.vertices) == 2
+        assert boundary.vertices[0][2] == pytest.approx(math.tan(math.pi / 8.0))
+
+    def test_clockwise_arc_has_negative_bulge(self):
+        from ezdxf.entities import Arc
+
+        # A reversed extrusion flips the arc orientation, producing a
+        # clockwise oriented quarter arc with a negative bulge.
+        arc = Arc()
+        arc.dxf.center = (0.0, 0.0)
+        arc.dxf.radius = 5.0
+        arc.dxf.start_angle = 0.0
+        arc.dxf.end_angle = 90.0
+        arc.dxf.extrusion = (0.0, 0.0, -1.0)
+        path = make_path(arc)
+        lwp = list(to_lwpolylines(path))[0]
+        points = lwp.get_points("xyb")
+        assert points[0][2] == pytest.approx(-math.tan(math.pi / 8.0))
+
+    def test_semicircle_bulge_is_one(self):
+        from ezdxf.entities import Arc
+
+        # A 180 degree arc is the degenerate case where the circle center lies
+        # directly on the chord; it still has to be detected as a circular arc.
+        arc = Arc()
+        arc.dxf.center = (1.0, 0.0)
+        arc.dxf.radius = 1.0
+        arc.dxf.start_angle = 180.0
+        arc.dxf.end_angle = 360.0
+        lwp = list(to_lwpolylines(make_path(arc)))[0]
+        points = lwp.get_points("xyb")
+        assert len(points) == 2
+        assert points[0][0] == pytest.approx(0.0)
+        assert points[1][0] == pytest.approx(2.0)
+        assert points[0][2] == pytest.approx(1.0)  # tan(180/4)
+
+    def test_clockwise_semicircle_bulge_is_minus_one(self):
+        from ezdxf.entities import Arc
+
+        arc = Arc()
+        arc.dxf.center = (1.0, 0.0)
+        arc.dxf.radius = 1.0
+        arc.dxf.start_angle = 180.0
+        arc.dxf.end_angle = 360.0
+        arc.dxf.extrusion = (0.0, 0.0, -1.0)
+        lwp = list(to_lwpolylines(make_path(arc)))[0]
+        points = lwp.get_points("xyb")
+        assert points[0][2] == pytest.approx(-1.0)
+
+
+class TestFullCircleToBulge:
+    """A full circle is split into two semicircles, not flattened."""
+
+    @staticmethod
+    def _circle_path(radius=2.0):
+        from ezdxf.entities import Circle
+
+        circle = Circle()
+        circle.dxf.center = (0.0, 0.0)
+        circle.dxf.radius = radius
+        return make_path(circle)
+
+    def test_circle_lwpolyline_two_semicircles(self):
+        lwp = list(to_lwpolylines(self._circle_path()))[0]
+        points = lwp.get_points("xyb")
+        assert len(points) == 2
+        assert lwp.closed is True
+        # opposite points on the circle, each semicircle has |bulge| == 1
+        p0, p1 = points
+        assert p0[0] == pytest.approx(2.0)
+        assert p0[1] == pytest.approx(0.0)
+        assert p1[0] == pytest.approx(-2.0)
+        assert p1[1] == pytest.approx(0.0)
+        assert abs(p0[2]) == pytest.approx(1.0)
+        assert abs(p1[2]) == pytest.approx(1.0)
+
+    def test_circle_polyline2d_two_semicircles(self):
+        pline = list(to_polylines2d(self._circle_path()))[0]
+        assert len(pline.vertices) == 2
+        assert pline.is_closed is True
+        for vertex in pline.vertices:
+            assert abs(vertex.dxf.bulge) == pytest.approx(1.0)
+
+    def test_circle_hatch_poly_path_two_semicircles(self):
+        hatch = list(to_hatches(self._circle_path(), edge_path=False))[0]
+        boundary = hatch.paths[0]
+        assert boundary.is_closed is True
+        assert len(boundary.vertices) == 2
+        for x, y, bulge in boundary.vertices:
+            assert abs(bulge) == pytest.approx(1.0)
+
+
+class TestMergeAdjacentArcs:
+    """Adjacent arc segments on the same circle merge into one bulge segment."""
+
+    def test_270_degree_arc_merges_to_single_bulge(self):
+        from ezdxf.entities import Arc
+
+        arc = Arc()
+        arc.dxf.center = (10.0, 0.0)
+        arc.dxf.radius = 3.0
+        arc.dxf.start_angle = 0.0
+        arc.dxf.end_angle = 270.0
+        lwp = list(to_lwpolylines(make_path(arc)))[0]
+        points = lwp.get_points("xyb")
+        # the three bezier quarter segments merge into a single arc segment
+        assert len(points) == 2
+        assert points[0][0] == pytest.approx(13.0)
+        assert points[0][1] == pytest.approx(0.0)
+        assert points[1][0] == pytest.approx(10.0)
+        assert points[1][1] == pytest.approx(-3.0)
+        # bulge of a 270 degree arc is tan(270/4) = tan(67.5)
+        assert points[0][2] == pytest.approx(math.tan(3 * math.pi / 8.0))
+
+
+class TestStraightLinesAndClosing:
+    def test_line_segments_get_no_extra_vertices(self):
+        p = Path()
+        p.line_to((2.0, 0.0))
+        p.line_to((2.0, 1.0))
+        lwp = list(to_lwpolylines(p))[0]
+        assert len(lwp) == 3
+        assert all(b == 0.0 for x, y, b in lwp.get_points("xyb"))
+        assert lwp.closed is False
+
+    def test_closed_contour_uses_closed_flag_without_repeated_vertex(self):
+        p = Path()
+        p.line_to((1.0, 0.0))
+        p.line_to((1.0, 1.0))
+        p.line_to((0.0, 1.0))
+        p.close()
+        lwp = list(to_lwpolylines(p))[0]
+        assert len(lwp) == 4
+        assert lwp.closed is True
+        # no coincident closing vertex: the last stored vertex differs from
+        # the first one
+        first = lwp[0][:2]
+        assert not all(a == b for a, b in zip(lwp[-1][:2], first))
+
+    def test_open_path_does_not_add_a_closing_vertex(self):
+        # An open path (end != start) is not flagged closed and keeps all of
+        # its vertices.
+        p = Path((0.0, 0.0))
+        p.line_to((1.0, 0.0))
+        p.line_to((1.0, 1.0))
+        p.line_to((0.0, 2.0))
+        lwp = list(to_lwpolylines(p))[0]
+        assert lwp.closed is False
+        assert len(lwp) == 4
+
+
+class TestFreeCurvesStayFlattened:
+    """Free-form (non circular) curves keep the distance/segments error control."""
+
+    @staticmethod
+    def _free_curve_path():
+        p = Path()
+        p.curve4_to((4.0, 0.0), (1.0, 2.0), (3.0, 1.0))
+        return p
+
+    def test_free_curve_has_no_bulge(self):
+        lwp = list(to_lwpolylines(self._free_curve_path()))[0]
+        assert all(b == 0.0 for x, y, b in lwp.get_points("xyb"))
+        assert len(lwp) > 2
+
+    def test_free_curve_respects_distance(self):
+        coarse = list(to_lwpolylines(self._free_curve_path(), distance=1.0))[0]
+        fine = list(to_lwpolylines(self._free_curve_path(), distance=0.001))[0]
+        assert len(fine) > len(coarse)
+
+    def test_ellipse_does_not_get_bulge(self):
+        from ezdxf.entities import Ellipse
+
+        ellipse = Ellipse()
+        ellipse.dxf.center = (0.0, 0.0)
+        ellipse.dxf.major_axis = (4.0, 0.0, 0.0)
+        ellipse.dxf.ratio = 0.5
+        lwp = list(to_lwpolylines(make_path(ellipse)))[0]
+        assert all(b == 0.0 for x, y, b in lwp.get_points("xyb"))
+
+
+class TestBulgeRoundTrip:
+    def test_arc_round_trip_preserves_center_and_radius(self):
+        from ezdxf.math import bulge_to_arc
+
+        lwp = list(
+            to_lwpolylines(TestCircularArcToBulge._arc_path((0.0, 0.0), 5.0, 0.0, 90.0))
+        )[0]
+        points = lwp.get_points("xyb")
+        center, start_angle, end_angle, radius = bulge_to_arc(
+            points[0][:2], points[1][:2], points[0][2]
+        )
+        assert radius == pytest.approx(5.0)
+        assert center.x == pytest.approx(0.0, abs=1e-9)
+        assert center.y == pytest.approx(0.0, abs=1e-9)
+
+    def test_lwpolyline_bulge_round_trip_through_make_path(self):
+        msp = VirtualLayout()
+        original = msp.add_lwpolyline(
+            [(0, 0, 0, 0, 1), (2, 0)],
+        )
+        original.closed = True
+        path = make_path(original)
+        rebuilt = list(to_lwpolylines(path))[0]
+        assert rebuilt.closed is True
+        points = rebuilt.get_points("xyb")
+        assert len(points) == 2
+        # the semicircle bulge is preserved on its start vertex and the
+        # contour is finished by the closed flag instead of a repeated vertex
+        assert points[0][2] == pytest.approx(1.0)
+        assert points[1][2] == 0.0
