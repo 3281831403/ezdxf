@@ -308,10 +308,14 @@ def from_hatch_boundary_path(
     else:
         raise TypeError(type(boundary))
 
-    if offset and ocs is not None:  # only for MPOLYGON
+    if offset:  # only for MPOLYGON
         # assume offset is in OCS
-        offset = ocs.to_wcs(offset.replace(z=elevation))
-        p = p.transform(Matrix44.translate(offset.x, offset.y, offset.z))
+        if ocs is not None:
+            offset = ocs.to_wcs(offset.replace(z=elevation))
+            p = p.transform(Matrix44.translate(offset.x, offset.y, offset.z))
+        else:
+            # path is in OCS coordinates and the elevation is already applied
+            p = p.transform(Matrix44.translate(offset.x, offset.y, 0.0))
 
     # attach path type information
     p.user_data = const.BoundaryPathState.from_flags(boundary.path_type_flags)

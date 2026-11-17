@@ -441,8 +441,9 @@ class DXFPolygon(DXFGraphic):
         from ezdxf import path
 
         elevation = Vec3(self.dxf.elevation)
-        if self.dxf.hasattr("offset"):  # MPOLYGON
-            elevation += Vec3(self.dxf.offset)  # offset in OCS?
+        if self.dxf.hasattr("offset_vector"):  # MPOLYGON
+            # the MPOLYGON offset vector is located in the OCS
+            elevation += Vec3(self.dxf.offset_vector)
         boundary_paths = [path.from_hatch_boundary_path(p) for p in self.paths]
         for vertices in path.triangulate(boundary_paths, max_sagitta, min_segments):
             yield tuple(elevation + v for v in vertices)

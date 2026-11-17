@@ -26,6 +26,7 @@ from ezdxf.document import Drawing
 from ezdxf.entities import (
     BlockRecord,
     DXFEntity,
+    DXFGraphic,
     DXFTagStorage,
     Ellipse,
     Hatch,
@@ -192,6 +193,7 @@ def export_lwpolyline(exporter: R12Exporter, entity: DXFEntity):
     assert isinstance(entity, LWPolyline)
     polyline = lwpolyline_to_polyline(entity)
     if len(polyline.vertices):
+        exporter.set_paperspace_flag(polyline)
         polyline.export_dxf(exporter.tagwriter())
 
 
@@ -199,6 +201,7 @@ def export_mesh(exporter: R12Exporter, entity: DXFEntity):
     assert isinstance(entity, Mesh)
     polyface_mesh = mesh_to_polyface_mesh(entity)
     if len(polyface_mesh.vertices):
+        exporter.set_paperspace_flag(polyface_mesh)
         polyface_mesh.export_dxf(exporter.tagwriter())
 
 
@@ -208,6 +211,7 @@ def export_spline(exporter: R12Exporter, entity: DXFEntity):
         entity, exporter.max_sagitta, exporter.min_spline_segments
     )
     if len(polyline.vertices):
+        exporter.set_paperspace_flag(polyline)
         polyline.export_dxf(exporter.tagwriter())
 
 
@@ -217,6 +221,7 @@ def export_ellipse(exporter: R12Exporter, entity: DXFEntity):
         entity, exporter.max_sagitta, exporter.min_ellipse_segments
     )
     if len(polyline.vertices):
+        exporter.set_paperspace_flag(polyline)
         polyline.export_dxf(exporter.tagwriter())
 
 
@@ -294,6 +299,7 @@ def export_hatch(exporter: R12Exporter, entity: DXFEntity) -> None:
     # export hatch into an anonymous block
     block = exporter.new_block(entity)
     insert = make_insert(block.name, entity)
+    exporter.set_paperspace_flag(insert)
     insert.export_dxf(exporter.tagwriter())
 
     if entity.has_pattern_fill:
@@ -309,12 +315,14 @@ def export_mpolygon(exporter: R12Exporter, entity: DXFEntity) -> None:
     # export mpolygon into an anonymous block
     block = exporter.new_block(entity)
     insert = make_insert(block.name, entity)
+    exporter.set_paperspace_flag(insert)
     insert.export_dxf(exporter.tagwriter())
 
-    # elevation is the z-axis of the vertices
+    # boundary paths as WCS coordinates, render_polylines2d() projects the
+    # vertices onto the plane defined by the extrusion vector of the MPOLYGON
     path.render_polylines2d(
         block,
-        path.from_hatch_ocs(entity, offset=Vec3(entity.dxf.offset)),
+        path.from_hatch(entity, offset=Vec3(entity.dxf.offset_vector)),
         distance=exporter.max_sagitta,
         segments=exporter.min_spline_segments,
         extrusion=Vec3(entity.dxf.extrusion),
@@ -349,6 +357,7 @@ def export_acad_table(exporter: R12Exporter, entity: DXFEntity) -> None:
     insert = Insert.new(
         dxfattribs={"name": block_name, "layer": layer, "insert": location}
     )
+    exporter.set_paperspace_flag(insert)
     insert.export_dxf(exporter.tagwriter())
 
 
@@ -473,6 +482,10 @@ class R12Exporter:
         self._next_block_number = detect_max_block_number(
             [br.dxf.name for br in doc.block_records]
         )
+        # entities are currently exported into the paperspace, DXF R12 has only
+        # a single paperspace and requires the paperspace flag (group code 67)
+        # to be set for all paperspace entities:
+        self.paperspace = False
         # Exporters are required to convert newer entity types into DXF R12 types.
         # All newer entity types without an exporter will be ignored.
         self.exporters: dict[str, Callable[[R12Exporter, DXFEntity], None]] = {
@@ -601,9 +614,26 @@ class R12Exporter:
 
         self._write_section_header("ENTITIES")
         self.export_entity_space(self.doc.modelspace().entity_space)
-        self.export_entity_space(self.doc.paperspace().entity_space)
+        # DXF R12 has only a single paperspace, merge all paperspace layouts
+        # into this one:
+        for layout in self.doc.layouts:
+            if layout.is_any_paperspace:
+                self.export_entity_space(layout.entity_space, paperspace=True)
         self._write_endsec()
         return in_memory_stream.getvalue()
+
+    def set_paperspace_flag(self, entity: DXFEntity) -> None:
+        """Set the paperspace flag for converted entities if the current export
+        target is the paperspace. (internal API)
+        """
+        if not self.paperspace:
+            return
+        if isinstance(entity, DXFGraphic):
+            entity.dxf.paperspace = 1
+            vertices = getattr(entity, "vertices", None)
+            if vertices is not None:  # POLYLINE, POLYFACE
+                for vertex in vertices:
+                    vertex.dxf.paperspace = 1
 
     def _export_block_record(self, block_record: BlockRecord):
         tagwriter = self._tagwriter
@@ -614,20 +644,34 @@ class R12Exporter:
         assert block_record.endblk is not None
         block_record.endblk.export_dxf(tagwriter)
 
-    def export_entity_space(self, space: EntitySpace):
+    def export_entity_space(
+        self, space: EntitySpace, paperspace: Optional[bool] = None
+    ):
         tagwriter = self._tagwriter
-        for entity in space:
-            if entity.MIN_DXF_VERSION_FOR_EXPORT > const.DXF12 or isinstance(
-                entity, DXFTagStorage
-            ):
-                exporter = self.exporters.get(entity.dxftype())
-                if exporter:
-                    exporter(self, entity)
-                    continue
-                if entity.proxy_graphic:
-                    export_proxy_graphic(self, entity)
-            else:
-                entity.export_dxf(tagwriter)
+        if paperspace is None:
+            # nested exports (proxy graphic, exploded MTEXT, ...) inherit the
+            # current export target:
+            paperspace = self.paperspace
+        prev_paperspace = self.paperspace
+        self.paperspace = paperspace
+        try:
+            for entity in space:
+                if entity.MIN_DXF_VERSION_FOR_EXPORT > const.DXF12 or isinstance(
+                    entity, DXFTagStorage
+                ):
+                    exporter = self.exporters.get(entity.dxftype())
+                    if exporter:
+                        exporter(self, entity)
+                        continue
+                    if entity.proxy_graphic:
+                        export_proxy_graphic(self, entity)
+                else:
+                    if paperspace and isinstance(entity, DXFGraphic):
+                        # exploded/virtual entities do not have a paperspace flag
+                        entity.dxf.paperspace = 1
+                    entity.export_dxf(tagwriter)
+        finally:
+            self.paperspace = prev_paperspace
 
     def _write_section_header(self, name: str) -> None:
         self._tagwriter.write_str(f"  0\nSECTION\n  2\n{name}\n")

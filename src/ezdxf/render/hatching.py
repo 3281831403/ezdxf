@@ -20,6 +20,7 @@ import random
 from ezdxf.math import (
     Vec2,
     Vec3,
+    NULLVEC,
     Bezier3P,
     Bezier4P,
     intersection_ray_cubic_bezier_2d,
@@ -619,19 +620,26 @@ def hatch_entity(
         return
     ocs = polygon.ocs()
     elevation = polygon.dxf.elevation.z
+    # the offset vector exists only in MPOLYGON entities and is located in the
+    # OCS, shifting the pattern fill lines by this offset in the OCS preserves
+    # the pattern phase in relation to the boundary paths
+    offset = NULLVEC
+    if polygon.dxf.hasattr("offset_vector"):  # MPOLYGON only
+        offset = Vec3(polygon.dxf.offset_vector)
     paths = hatch_boundary_paths(polygon, filter_text_boxes)
-    # todo: MPOLYGON offset
     # All paths in OCS!
     for baseline in pattern_baselines(polygon, jiggle_origin=jiggle_origin):
         for line in hatch_paths(baseline, paths):
             line_pattern = baseline.pattern_renderer(line.distance)
             for s, e in line_pattern.render(line.start, line.end):
                 if ocs.transform:
-                    yield ocs.to_wcs((s.x, s.y, elevation)), ocs.to_wcs(
-                        (e.x, e.y, elevation)
-                    )
+                    yield ocs.to_wcs(
+                        (s.x + offset.x, s.y + offset.y, elevation)
+                    ), ocs.to_wcs((e.x + offset.x, e.y + offset.y, elevation))
                 else:
-                    yield Vec3(s.x, s.y, elevation), Vec3(e.x, e.y, elevation)
+                    yield Vec3(s.x + offset.x, s.y + offset.y, elevation), Vec3(
+                        e.x + offset.x, e.y + offset.y, elevation
+                    )
 
 
 def hatch_boundary_paths(polygon: DXFPolygon, filter_text_boxes=True) -> list[Path]:
